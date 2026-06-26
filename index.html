@@ -399,6 +399,11 @@ function renderToolbar(){
     <button class="fbtn" onclick="clickFaviconUpload()" title="브라우저 탭/홈화면 아이콘 변경">변경</button>
     <button class="fbtn" onclick="resetFavicon()" title="기본 아이콘으로">초기화</button>
     <div class="sep"></div>
+    <span class="color-label">동기화</span>
+    <span id="sync-status" class="color-label" style="color:#999">☁ …</span>
+    <button class="fbtn" onclick="forceUpload()" title="이 기기 데이터를 클라우드에 올리기(기준으로)">올리기</button>
+    <button class="fbtn" onclick="forcePull()" title="클라우드 데이터 불러오기">받기</button>
+    <div class="sep"></div>
     <span class="filter-label">필터</span>
     <div class="filter-wrap">${filterBtns}</div>
   </div>`;
@@ -566,6 +571,7 @@ function fullRender(){
     +`</div>`+
     renderModal()+renderConfirm();
   autosave();
+  setSync(syncState);
 }
 
 function switchBike(i){curBike=i;editTarget=null;nickEditing=false;activeFilters=new Set(['전체']);fullRender();}
@@ -655,32 +661,92 @@ document.getElementById('bike-img-file').addEventListener('change',function(){
 /* ---------- 상태 저장 / 불러오기 / 파일 내보내기 ---------- */
 const STORE_KEY='nfs_garage_v1';
 
-function loadState(){
-  let embedded=null, ls=null;
-  try{
-    const el=document.getElementById('__STATE__');
-    if(el){const t=(el.textContent||'').trim(); if(t&&t!=='null') embedded=JSON.parse(t);}
-  }catch(e){}
-  try{
-    const raw=localStorage.getItem(STORE_KEY);
-    if(raw) ls=JSON.parse(raw);
-  }catch(e){}
-  let pick=null;
-  // 파일에 내장된 상태가 있으면 그 파일이 곧 진실(파일별 독립 저장).
-  // 내장 상태가 없을 때(원본/기본 파일)만 브라우저 임시저장을 사용.
-  if(ls) pick=ls;
-  else pick=embedded;
-  if(pick&&Array.isArray(pick.DATA)){
-    DATA=pick.DATA;
-    if(typeof pick.nextId==='number') nextId=pick.nextId;
-    if(typeof pick.curBike==='number'&&pick.curBike<DATA.length) curBike=pick.curBike;
-    if(typeof pick.customFavicon==='string') customFavicon=pick.customFavicon;
+// ---------- 클라우드 동기화 (JSONBin) ----------
+const SYNC={
+  binId:'6a3dee12da38895dfe00b0cd',
+  key:'$2a$10$aB4HlDFNUKhZcm0X7.9mU.6tUtLFbG/rgZV69vIzeMqe9EEGoh9/e',
+  base:'https://api.jsonbin.io/v3/b'
+};
+let booting=true, stateTs=0, syncState='idle', syncTimer=null;
+
+function currentStateObj(){ return {DATA,nextId,curBike,customFavicon,ts:(stateTs||Date.now()),v:1}; }
+function saveLocal(){ try{ localStorage.setItem(STORE_KEY, JSON.stringify(currentStateObj())); }catch(e){} }
+function applyState(p){
+  if(p&&Array.isArray(p.DATA)){
+    DATA=p.DATA;
+    if(typeof p.nextId==='number') nextId=p.nextId;
+    if(typeof p.curBike==='number'&&p.curBike<DATA.length) curBike=p.curBike;
+    if(typeof p.customFavicon==='string') customFavicon=p.customFavicon;
   }
-  applyFavicon();
+}
+function localState(){ try{ const r=localStorage.getItem(STORE_KEY); if(r) return JSON.parse(r);}catch(e){} return null; }
+function embeddedState(){ try{ const el=document.getElementById('__STATE__'); if(el){const t=(el.textContent||'').trim(); if(t&&t!=='null') return JSON.parse(t);} }catch(e){} return null; }
+
+function syncLabel(){
+  const m={idle:['☁ 동기화됨','#00b04a'],loading:['☁ 불러오는중','#999'],saving:['☁ 저장중','#f5a623'],error:['☁ 오류','#e03010'],offline:['☁ 오프라인','#999']};
+  return m[syncState]||m.idle;
+}
+function setSync(s){ syncState=s; const el=document.getElementById('sync-status'); if(el){const a=syncLabel(); el.textContent=a[0]; el.style.color=a[1];} }
+
+async function remoteRead(){
+  const res=await fetch(SYNC.base+'/'+SYNC.binId+'/latest',{headers:{'X-Master-Key':SYNC.key,'X-Bin-Meta':'false'}});
+  if(!res.ok) throw new Error('read '+res.status);
+  const j=await res.json();
+  return (j && j.record!==undefined) ? j.record : j;   // 메타 래퍼가 와도 안전하게 언랩
+}
+async function remoteWrite(obj){
+  const res=await fetch(SYNC.base+'/'+SYNC.binId,{method:'PUT',headers:{'Content-Type':'application/json','X-Master-Key':SYNC.key,'X-Bin-Versioning':'false'},body:JSON.stringify(obj)});
+  if(!res.ok) throw new Error('write '+res.status);
+  return await res.json();
 }
 
 function autosave(){
-  try{ localStorage.setItem(STORE_KEY, JSON.stringify({DATA,nextId,curBike,customFavicon,ts:Date.now()})); }catch(e){}
+  if(booting) return;            // 부팅 중엔 원격 덮어쓰기 방지
+  stateTs=Date.now();
+  saveLocal();
+  scheduleRemoteSave();
+}
+function scheduleRemoteSave(){
+  if(syncTimer) clearTimeout(syncTimer);
+  setSync('saving');
+  syncTimer=setTimeout(async function(){
+    try{ await remoteWrite(currentStateObj()); setSync('idle'); }
+    catch(e){ setSync(navigator.onLine===false?'offline':'error'); }
+  },1200);
+}
+
+async function forceUpload(){
+  stateTs=Date.now(); saveLocal(); setSync('saving');
+  try{ await remoteWrite(currentStateObj()); setSync('idle'); showToast('☁ 이 기기 데이터를 클라우드에 올렸어요'); }
+  catch(e){ setSync('error'); showToast('업로드 실패 — 인터넷/키 확인'); }
+}
+async function forcePull(){
+  setSync('loading');
+  try{
+    const r=await remoteRead();
+    if(r&&Array.isArray(r.DATA)){ applyState(r); stateTs=r.ts||Date.now(); saveLocal(); applyFavicon(); fullRender(); showToast('☁ 클라우드 데이터를 불러왔어요'); }
+    else showToast('클라우드에 데이터가 아직 없어요');
+    setSync('idle');
+  }catch(e){ setSync('error'); showToast('불러오기 실패 — 인터넷/키 확인'); }
+}
+
+async function bootstrap(){
+  booting=true;
+  const emb=embeddedState(), loc=localState();
+  let best=(loc&&emb)?(((loc.ts||0)>=(emb.ts||0))?loc:emb):(loc||emb);
+  applyState(best); stateTs=best?(best.ts||0):0;
+  applyFavicon(); fullRender();
+  setSync('loading');
+  try{
+    const remote=await remoteRead();
+    const ok=remote&&Array.isArray(remote.DATA);
+    const bestTs=best?(best.ts||0):-1;
+    if(ok&&(remote.ts||0)>bestTs){ applyState(remote); stateTs=remote.ts||Date.now(); saveLocal(); applyFavicon(); fullRender(); }
+    else if(ok&&(remote.ts||0)<bestTs){ await remoteWrite(currentStateObj()); }
+    else if(!ok&&best){ await remoteWrite(currentStateObj()); }
+    setSync('idle');
+  }catch(e){ setSync(navigator.onLine===false?'offline':'error'); }
+  booting=false;
 }
 
 function showToast(msg){
@@ -774,8 +840,9 @@ document.addEventListener('keydown',function(e){
   if((e.ctrlKey||e.metaKey)&&(e.key==='s'||e.key==='S')){e.preventDefault();exportHTML();}
 });
 
-loadState();
-fullRender();
+window.addEventListener('online', function(){ if(syncState==='offline'||syncState==='error') scheduleRemoteSave(); });
+window.addEventListener('offline', function(){ setSync('offline'); });
+bootstrap();
 </script>
 
 
